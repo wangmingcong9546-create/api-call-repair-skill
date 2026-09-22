@@ -162,19 +162,78 @@ grep -a "Vision auto-detect: using main provider" "$HERMES_HOME"/logs/agent.log 
 
 key 送对了、URL 对了，仍可能 400。常见是 **agent 发了厂商不接受的参数**。
 
-实例：智谱 `glm-5.3-flash` 强制思考，而 agent 发了「关闭思考」：
+实例：智谱 `glm-5.3-flash` 的 reasoning 参数只收 `low` / `high` / `max`：
 
+| 请求体 | 结果 |
+|---|---|
+| `reasoning_effort: "medium"` | ❌ 1210 |
+| `reasoning_effort: low / high / max` | ✅ 200 |
+| `thinking: {"type":"disabled"}` | ❌ 1210（同一错误码的另一条触发路径） |
+| 不带 reasoning 字段 | ✅ 200 |
+
+**这里有个专门的陷阱：报错文案会骗你。** 智谱那次的文案是「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」——听起来像是 agent 发了「关闭思考」，实际 agent 发的是 `reasoning_effort: "medium"`（**值非法**）。照着文案去查「谁禁用了思考」会一路查到死。**永远以实际请求体为准，不要从错误文案反推参数。**
+
+### 怎么拿到实际请求体
+
+失败时最容易：agent 一般会在报错时落盘 request dump（Hermes 是 `$HERMES_HOME/sessions/request_dump_*.json`）。
+
+**但成功的请求通常不写 dump** —— 于是「改完到底发了什么」就验证不了。解法是**起一个本地探针当假端点**：
+
+```python
+# probe_server.py — 记录请求体，并返回 200 让 agent 继续跑下去
+import http.server, json
+OUT = r"/abs/path/capture.jsonl"   # 必须用绝对路径！Windows 上用 Git Bash 的 /tmp 会被解析成 C:\tmp
+open(OUT, 'w').close()
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        b = json.loads(self.rfile.read(n))
+        with open(OUT, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'path': self.path,
+                                'keys': {k: v for k, v in b.items() if k not in ('messages', 'tools')},
+                                'n_msgs': len(b.get('messages', [])),
+                                'n_tools': len(b.get('tools', []))}, ensure_ascii=False) + "\n")
+        data = json.dumps({"id": "p", "object": "chat.completion", "created": 0, "model": "p",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{}"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *a): pass
+
+http.server.HTTPServer(('127.0.0.1', 8899), H).serve_forever()
 ```
-agent 发: thinking: {"type":"disabled"}  → 1210 该模型始终思考，不支持关闭思考
-实测:     thinking: {"type":"enabled"}   → 200 OK
-```
 
-**定位法**：从 dump 里取出**完整的 request body**，逐字段拿 curl 复现，用二分法删字段找出哪个参数惹的祸。
+把目标 provider 的 `base_url` 临时指到 `http://127.0.0.1:8899/v1`，跑一次，就能看到 agent 发出的**完整请求体**。
 
-**修法**（按优先级）：
+两个注意点：
+- 一个会话会打**多个**请求（主对话 + 生成标题等 auxiliary 调用），所以要**追加记录全部**，不要只留最后一个——否则你看到的可能只是标题生成请求。
+- 探针的响应要返回**正常的 200 和合法 JSON**，否则 auxiliary 调用先失败，agent 会直接中断，主对话请求根本不会发出。
+
+> 收尾：探针用完记得关进程（`netstat -ano | grep :8899` 找 PID，再 `taskkill //F //PID <pid>`），并把 base_url 改回真实地址。Windows 上端口可能被多个残留进程同时占用，杀完要确认端口真的空了。
+
+### 改完必须做反向对照
+
+**测试通过 ≠ 修复生效。** 曾经出现：以为某个配置项是解药，改完一测通过就宣布修好了——实际上把该配置项故意设成**已知非法值**再测，**依然通过**，说明这个配置项根本没被读。是反向对照才揭穿了它。
+
+所以流程是三步：
+
+1. 改之前先复现失败
+2. 改完验证通过
+3. **再把该值设回已知的坏值，确认失败复现**
+
+三步都成立，才能说这个改动是决定性的。第 3 步不能省。
+
+> 反例：Hermes 的 `agent.reasoning_overrides` 文档齐全、源码里有完整的解析函数（`hermes_constants.resolve_reasoning_config`），但对 chat_completions 这条路径**完全不生效**——抓包证实：设成 `high` 后，请求体里依然没有该字段。**配置项存在 ≠ 这条代码路径会读它。**
+
+**修法**（按优先级，但先确认该配置项真的生效）：
 
 1. provider 条目加 `extra_body` 覆盖该字段
-2. 调高/调低 agent 的 reasoning 等级（Hermes：`--reasoning low|high|max`）
+2. 调高/调低 agent 的 reasoning 等级
 3. 换一个接受该参数的模型
 
 ---

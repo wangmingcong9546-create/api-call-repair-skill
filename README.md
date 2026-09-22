@@ -54,7 +54,7 @@ git clone https://github.com/wangmingcong9546-create/api-call-repair-skill.git `
 
 ## 来源
 
-整理自一次真实排查：Hermes 接智谱 GLM 与 Kimi 的过程中，先后踩中「cc-switch 写错配置文件路径」「provider 名字撞内置别名导致 Key 送不出去」「base_url 少 `/v1`」「api_key 混入 `Authorization:` 前缀」四个坑，以及一个请求体参数不兼容（`thinking` 参数）问题。
+整理自一次真实排查：Hermes 接智谱 GLM 与 Kimi 的过程中，先后踩中「cc-switch 写错配置文件路径」「provider 名字撞内置别名导致 Key 送不出去」「base_url 少 `/v1`」「api_key 混入 `Authorization:` 前缀」四个坑，以及一个请求体参数不兼容问题（`reasoning_effort` 取了厂商不接受的值）。
 
 ## License
 
