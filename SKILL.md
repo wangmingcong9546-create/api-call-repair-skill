@@ -1,6 +1,6 @@
 ---
 name: api-call-repair
-description: 诊断并修复第三方 LLM API 接入 agent CLI（Hermes / Claude Code / Cursor 等，含 cc-switch 等中转工具）时的鉴权与连接失败。出现 401、「未收到 Authorization 参数」、「身份验证失败」、url.not_found、模型不存在，或配置改了却不生效时使用。Diagnose and fix third-party LLM API authentication/config failures in agent CLIs.
+description: 诊断并修复第三方 LLM API 接入 agent CLI（Hermes / Claude Code / Cursor 等，含 cc-switch 等中转工具）时的鉴权与连接失败。出现 401、「未收到 Authorization 参数」、「身份验证失败」、url.not_found、模型不存在，或配置改了却不生效时使用。也用于排查后收尾：把散落在配置/备份/日志/dump/中转工具库里的 API key 收干净。Diagnose and fix third-party LLM API authentication/config failures in agent CLIs, and safely scrub leaked API keys afterwards.
 ---
 
 # API 调用修复
@@ -238,6 +238,72 @@ http.server.HTTPServer(('127.0.0.1', 8899), H).serve_forever()
 
 ---
 
+## 收尾：把密钥收干净
+
+修完之后，key 往往散落在 dump、日志、备份、会话记录、中转工具库里。目标状态是**明文 key 只存在于一处**（通常是 `.env`），其余地方一律引用或脱敏。
+
+### 让 config 引用环境变量，而不是内嵌 key
+
+Hermes 的 `custom_providers` 支持 `key_env` / `api_key_env`，填**环境变量名**而非明文：
+
+```yaml
+  - name: bigmodel
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    key_env: ZHIPU_API_KEY      # 而不是 api_key: <明文>
+```
+
+key 放 `$HERMES_HOME/.env`（Hermes 启动时由 `load_hermes_dotenv()` 自动加载），这样配置文件可以随便外发。
+
+**迁移完必须做反向对照**（道理同第 7 步）：把 `.env` 里那个变量**改名**再实跑，应当立刻 401；若仍然成功，说明 key 是从别处（凭据池 / 缓存）来的，你的改动根本没被读到。
+
+### key 都藏在哪
+
+一次排查之后，key 会散在这些地方——逐个确认，别只清最显眼的那个：
+
+- 配置文件及其**历史备份**（`config.yaml.bak-*` 最容易被忽略）
+- `request dump`——但注意：Hermes 的 dump 里 Authorization 头**本来就是截断预览**（形如 `abcd1234...wxyz`，前 8 位 + 后 4 位），不含完整 key，**先确认再动手**，别做无用功
+- 日志（`logs/agent.log`）
+- agent CLI 自己的**会话记录与文件快照**（Claude Code：`~/.claude/projects/*/*.jsonl`、`~/.claude/file-history/`）
+- **中转工具的数据库与备份**（cc-switch：`cc-switch.db` + `backups/`）
+- 环境变量文件本身（这是唯一该保留明文的落点）
+
+**凭据池文件通常只存指纹不存明文**（Hermes 的 `auth.json` 存 `sha256:...`），先确认再决定要不要处理。
+
+### ⚠️ 扫描密钥时最容易闯的祸
+
+**不要用 `sk-[A-Za-z0-9_-]{20,}` 这类宽泛正则全盘扫。** 它会**假阳性**，而且一旦顺手做了替换，**会损坏真实数据**。
+
+真实翻车案例：`references/delegate-task-concurrency-diagnosis.md` 这个文件名含 `...ta` + **`sk-concurrency-diagnosis`**，正好命中 `sk-<20+ 字符>`。替换后 5 个 dump 里的正常文本变成了 `<REDACTED>`，而当时**没有备份**，最后是从磁盘上找到同名文件反查出原文才修好的。同一次扫描还谎报了 `settings.json`、`history.jsonl`、`state.db`、`cache/*.sh` 一堆「命中」，实际一个都不含密钥。
+
+**正确做法**——从唯一可信源读出真实字符串，做**字面比对**：
+
+```python
+import pathlib
+keys = set()
+for l in pathlib.Path(r"<HERMES_HOME>/.env").read_text(encoding="utf-8").splitlines():
+    if "=" in l:
+        v = l.partition("=")[2].strip()
+        if v: keys.add(v)
+
+for f in pathlib.Path(r"<要扫的目录>").rglob("*"):
+    if not f.is_file(): continue
+    data = f.read_bytes()                       # 用 bytes 比对，不受编码影响
+    if any(k.encode() in data for k in keys):
+        print(f)                                # 零假阳性
+```
+
+**替换前先看清命中的到底是什么**——只替换完整的 key 字面量，永远不要用模式去猜。**动手前先备份**（这一次就是没备份才差点救不回来）。
+
+### 多服务的密钥库不要整个删
+
+`~/.cc-switch/cc-switch.db` 里可能同时存着**好几个服务**的凭据（实测一份库里躺着 Claude Official / DeepSeek / codex / 智谱 / Kimi）。弃用某个工具时**只脱敏相关条目，不要 `rm -rf` 整个目录**——那会连带毁掉你还在用的其他配置。
+
+另外：这类工具**运行时可能把内存里的配置写回库**，所以改完要复核；最稳妥是**先关掉它再改**。
+
+最后一句可能最要紧：**清理只是止损，不等于没泄露过。** 凡是曾经明文落过盘的 key，正规做法是**轮换**，而不是擦干净当无事发生。
+
+---
+
 ## 陷阱清单
 
 - **中转工具的「检查通过」不可信**。cc-switch 之类的「测速 / 健康检查」测的是**它自己库里**的配置，可能已自动补上 `/v1`、规范化了端点。它绿灯不代表 agent 能用；它的红灯也可能只是它自己路径的问题（曾出现：工具检查报 200，agent 实跑 404）。
@@ -246,6 +312,8 @@ http.server.HTTPServer(('127.0.0.1', 8899), H).serve_forever()
 - **中转工具可能用 db 的 id 当 provider 名**。给条目起 id 时就要避开别名（见第 3 步）。
 - **成功的请求不写 dump**。要验证一次成功调用，看 `agent.log`，不要看 `sessions/`。
 - **别只看报错文案**。同一个 401 可能来自五个不同的层。先跑第 1 步的 curl 对照表，让厂商的**原始错误码**告诉你坏在哪一层。
+- **别用宽泛正则扫密钥**。`sk-...` 这类模式会命中普通文件名并造成假阳性，替换下去就是**数据损坏**（详见「收尾」一节的翻车案例）。用真实 key 字面量比对，动手前先备份。
+- **凭据池里的明文可能根本不存在**。dump 的 Authorization 头常是截断预览，`auth.json` 之类只存指纹——**先确认再动手**，否则会像上面那样白干还搞坏东西。
 
 ---
 
